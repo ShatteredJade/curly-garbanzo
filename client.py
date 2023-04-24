@@ -38,6 +38,7 @@ class ChatClient:
     def login(self):
         self.username = input('Please enter a username: ')
         password = input('Please enter a password: ')
+        self.username = self.username.lower().title()  # username not case-sensitive, title for formatting
 
         self.client.recv(1024)  # wait for username request
         self.client.send(self.username.encode('utf-8'))

@@ -1,6 +1,11 @@
 import socket
 import threading
 import logging
+import bcrypt
+import sqlite3
+import time
+
+# IMPLEMENT HASHING W/ SALTING AND PEPPERING
 
 # host address:port
 host = '127.0.0.1'
@@ -15,6 +20,12 @@ con_accept = 'ACCEPT'
 disconnect = '!disconnect'
 kick = '!kick '
 ban = '!ban '
+unban = '!unban '
+
+# roles
+admin = 'admin'
+user = 'user'
+banned = 'banned'
 
 
 class ServerHost:
@@ -22,10 +33,8 @@ class ServerHost:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.bind((host, port))
         self.logger = logging.getLogger(__name__)
-        self.accounts = {'Archaon': 'admin'}
         self.clients = {}
-        self.admins = ['Archaon']
-        self.banned = []
+        self.create_db()
 
     def receive(self):
         self.server.listen(5)
@@ -62,7 +71,10 @@ class ServerHost:
 
         # check if msg is a command
         if msg.startswith('!'):
-            self.commands(msg, client, username)
+            # call command, if it fails send an error msg
+            if not self.commands(msg, client, username):
+                self.logger.error(f"{username} requested an invalid command '{msg}'")
+                client.send(f"Invalid command '{msg}'".encode('utf-8'))
         else:
             self.broadcast(msg)
 
@@ -101,17 +113,17 @@ class ServerHost:
 
     def con_access(self, username, password):
         # if new user, add to existing accounts and accept connection
-        if username not in self.accounts:
-            self.accounts[username] = password
+        if not self.check_acct(username):
+            self.create_acct(username, password)
             return True, con_accept
 
-        if password != self.accounts.get(username):
+        if not self.check_pass(username, password):
             return False, 'Wrong password'
 
         if username in self.clients.keys():
             return False, 'User already logged in'
 
-        if username in self.banned:
+        if self.check_role(username, banned):
             return False, 'User has been banned'
 
         # existing user, correct password, not logged in. accept connection.
@@ -122,6 +134,17 @@ class ServerHost:
         client.close()
         self.broadcast(f'{username} has logged off!')
 
+    def force_logoff(self, username, user_target, cond):
+        if cond == kick:
+            action = 'kicked'
+        else:
+            action = 'banned'
+
+        client_target = self.clients.get(user_target)  # find associated client for kick target
+        del self.clients[user_target]
+        client_target.send(f'You have been {action} by admin {username}'.encode('utf-8'))
+        client_target.close()
+
     def broadcast(self, msg):
         for client in self.clients.values():
             client.send(msg.encode('utf-8'))
@@ -130,60 +153,204 @@ class ServerHost:
         if msg == disconnect:
             self.logger.info(f'{username} requested logout...')
             self.logoff(client, username)
-            return
+            return True
 
-        if username in self.admins:
-            if msg.startswith(kick):
-                self.kick(client, username, msg)
-                return
+        # if user is not an admin, return before checking admin cmds
+        if not self.check_role(username, admin):
+            return False
 
-            elif msg.startswith(ban):
-                self.ban(client, username, msg)
-                return
+        # isolate and format target username
+        seperator_index = msg.find(' ')
+        user_target = msg[seperator_index + 1:]
+        user_target = user_target.lower().title()
 
-        self.logger.error(f"{username} requested an invalid command '{msg}'")
-        client.send(f"Invalid command '{msg}'".encode('utf-8'))
+        return self.admin_commands(client, username, user_target, msg)
 
-    def kick(self, client, username, msg):
-        user_kick = msg[len(kick):]  # Find the selected username to kick
+    def admin_commands(self, client, username, user_target, msg):
+        # for commands that require db access
+        connection = sqlite3.connect('userdata.db')
+        cursor = connection.cursor()
+
+        if msg.startswith(kick):
+            success, action = self.kick(client, username, user_target)
+
+        elif msg.startswith(ban):
+            success, action = self.ban(client, username, user_target, connection, cursor)
+
+        elif msg.startswith(unban):
+            success, action = self.unban(client, username, user_target, connection, cursor)
+
+        else:
+            return False
+
+        if success:
+            self.cmd_broadcast(username, user_target, action)
+
+        return True
+
+    def cmd_broadcast(self, username, user_target, action):
+        msg = f'{username} has {action} user {user_target}'
+        self.logger.info(msg)
+        self.broadcast(msg)
+
+    def kick(self, client, username, user_kick):
         self.logger.info(f'{username} requested to kick {user_kick}')
 
+        # if user is logged in, remove client and send kick msg
         try:
-            # find the associated client socket for the user being kicked
-            client_kick = self.clients.get(user_kick)
-
-            del self.clients[user_kick]
-            client_kick.send(f'You have been kicked by admin {username}'.encode('utf-8'))
-            client_kick.close()
-
-            self.logger.info(f'Successfully kicked {user_kick}')
-            self.broadcast(f'{username} has kicked user {user_kick}')
-
+            self.force_logoff(username, user_kick, kick)
         except KeyError:
             error = f'Could not kick {user_kick}, user does not exist or is not logged in'
             self.logger.error(error)
             client.send(error.encode('utf-8'))
+            return False
 
-    def ban(self, client, username, msg):
-        user_ban = msg[len(ban):]  # find the selected username to ban
+        return True, 'kicked'
+
+    def ban(self, client, username, user_ban, connection, cursor):
         self.logger.info(f'{username} requested to ban {user_ban}')
 
+        # check if target user exists
+        if not self.target_check(client, user_ban, ban):
+            return False
+
+        cursor.execute(f"""
+        UPDATE accounts
+        SET role = '{banned}'
+        WHERE username = '{user_ban}'
+        """)
+
+        connection.commit()
+
+        # if user is logged in, remove client and send ban msg
         try:
-            # find the associated client socket for the user being banned
-            client_ban = self.clients.get(user_ban)
-
-            self.banned.append(user_ban)
-            del self.clients[user_ban]
-            client_ban.send(f'You have been banned by admin {username}'.encode('utf-8'))
-            client_ban.close()
-
-            self.logger.info(f'Successfully banned {user_ban}')
-            self.broadcast(f'{username} has banned user {user_ban}')
-
+            self.force_logoff(username, user_ban, ban)
         except KeyError:
-            error = f'Could not ban {user_ban}, user does not exist'
+            pass
+
+        return True, 'banned'
+
+    def unban(self, client, username, user_unban, connection, cursor):
+        self.logger.info(f'{username} requested to unban {user_unban}')
+
+        # check if acct exists and if they're banned
+        if not self.target_check(client, user_unban, unban):
+            return False
+
+        cursor.execute(f"""
+                UPDATE accounts
+                SET role = '{user}'
+                WHERE username = '{user_unban}'
+                """)
+
+        connection.commit()
+
+        return True, 'unbanned'
+
+    def target_check(self, client, user_target, cond):
+        if cond == unban:
+            action = 'unban'
+        else:
+            action = 'ban'
+
+        if not self.check_acct(user_target):
+            error = f'Could not {action} {user_target}, user does not exist'
             self.logger.error(error)
             client.send(error.encode('utf-8'))
+            return False
+
+        if cond == unban and not self.check_role(user_target, banned):
+            error = f'Could not unban {user_target}, user is not banned'
+            self.logger.error(error)
+            client.send(error.encode('utf-8'))
+            return False
+
+        return True
+
+    def create_db(self):
+        connection = sqlite3.connect('userdata.db')
+        cursor = connection.cursor()
+
+        try:
+            cursor.execute('''
+            CREATE TABLE accounts (
+                username TEXT,
+                password TEXT,
+                role TEXT
+            )
+            ''')
+
+            cursor.execute("""
+            INSERT INTO accounts VALUES
+                ('Archaon', 'pass', 'admin') 
+            """)
+
+            connection.commit()
+
+        except sqlite3.OperationalError:
+            return
+
+    def create_acct(self, username, password):
+        connection = sqlite3.connect('userdata.db')
+        cursor = connection.cursor()
+
+        cursor.execute(f"""
+        INSERT INTO accounts VALUES
+            ('{username}', '{password}', 'user')
+        """)
+
+        connection.commit()
+
+    def check_acct(self, username):
+        connection = sqlite3.connect('userdata.db')
+        cursor = connection.cursor()
+
+        cursor.execute(f"""
+        SELECT username FROM accounts
+            WHERE username = '{username}'
+        """)
+
+        username = cursor.fetchone()
+
+        connection.commit()
+
+        if username:
+            return True
+        return False
+
+    def check_pass(self, username, password):
+        connection = sqlite3.connect('userdata.db')
+        cursor = connection.cursor()
+
+        cursor.execute(f"""
+        SELECT password FROM accounts
+            WHERE username = '{username}'
+        """)
+
+        data = cursor.fetchone()
+
+        connection.commit()
+
+        if data[0] == password:
+            return True
+        return False
+
+    def check_role(self, username, cond):
+        connection = sqlite3.connect('userdata.db')
+        cursor = connection.cursor()
+
+        cursor.execute(f"""
+        SELECT role FROM accounts
+            WHERE username = '{username}'
+        """)
+
+        role = cursor.fetchone()
+
+        connection.commit()
+
+        if role[0] == cond:
+            return True
+        return False
 
 
 if __name__ == '__main__':
