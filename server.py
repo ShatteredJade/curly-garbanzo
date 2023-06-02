@@ -3,9 +3,11 @@ import threading
 import logging
 import bcrypt
 import sqlite3
-import time
 
 # IMPLEMENT HASHING W/ SALTING AND PEPPERING
+
+# database name
+database = 'userdata.db'
 
 # host address:port
 host = '127.0.0.1'
@@ -42,22 +44,23 @@ class ServerHost:
 
         while True:
             client, addr = self.server.accept()
-            f_addr = f'{addr[0]}:{addr[1]}'
+            f_addr = f'{addr[0]}:{addr[1]}'  # format ip address
             self.logger.info(f'Connected with {f_addr}')
 
             client_thread = threading.Thread(target=self.handle, args=(client, f_addr))
             client_thread.start()
 
+    # Handles client login and messages
     def handle(self, client, f_addr):
         self.logger.info(f'Attempting login with {f_addr}...')
-        while True:
+        while True:  # repeat until login is accepted
             access, username = self.login(client, f_addr)
             if access:
                 break
 
         try:
             while True:
-                self.handle_message(client, username)  # receive and vet messages
+                self.handle_message(client, username)
 
         except ConnectionResetError:
             self.logger.error(f'Lost connection with {username} ({f_addr})')
@@ -66,6 +69,7 @@ class ServerHost:
         except OSError:
             self.logger.info(f'Closed connection with {username} ({f_addr})')
 
+    # Checks if a message is a command before broadcasting
     def handle_message(self, client, username):
         msg = client.recv(1024).decode('utf-8')
 
@@ -78,6 +82,7 @@ class ServerHost:
         else:
             self.broadcast(msg)
 
+    # Gathers login data, checks it, accepts or denies connection
     def login(self, client, f_addr):
         try:
             # gather login data
@@ -100,6 +105,7 @@ class ServerHost:
             self.logger.error(f'Connection lost with {f_addr} while attempting login')
             return
 
+    # Gathers plaintext username and bytestring password from client
     def login_data(self, client, f_addr):
         client.send(req_user.encode('utf-8'))
         self.logger.info(f'Requesting username from {f_addr}')
@@ -107,10 +113,11 @@ class ServerHost:
 
         client.send(req_pass.encode('utf-8'))
         self.logger.info(f'Requesting password from {f_addr}')
-        password = client.recv(1024).decode('utf-8')
+        password = client.recv(1024)  # keep bytestring for hash
 
         return username, password
 
+    # Accepts or denies connection with client depending on login data
     def con_access(self, username, password):
         # if new user, add to existing accounts and accept connection
         if not self.check_acct(username):
@@ -129,18 +136,25 @@ class ServerHost:
         # existing user, correct password, not logged in. accept connection.
         return True, con_accept
 
+    # Removes client from logged-in users
     def logoff(self, client, username):
         del self.clients[username]
         client.close()
+
+        self.logger.info(f'{username} successfully logged off')
         self.broadcast(f'{username} has logged off!')
 
-    def force_logoff(self, username, user_target, cond):
-        if cond == kick:
+    # Logoff as a result of a command
+    def force_logoff(self, username, user_target, command):
+        if command == kick:
             action = 'kicked'
         else:
             action = 'banned'
 
+        command = command[1:-1]  # format command into readable text
         client_target = self.clients.get(user_target)  # find associated client for kick target
+
+        self.logger.info(f'Attempting to {command[1:-1]} {user_target} by admin {username}')
         del self.clients[user_target]
         client_target.send(f'You have been {action} by admin {username}'.encode('utf-8'))
         client_target.close()
@@ -168,7 +182,7 @@ class ServerHost:
 
     def admin_commands(self, client, username, user_target, msg):
         # for commands that require db access
-        connection = sqlite3.connect('userdata.db')
+        connection = sqlite3.connect(database)
         cursor = connection.cursor()
 
         if msg.startswith(kick):
@@ -247,19 +261,20 @@ class ServerHost:
 
         return True, 'unbanned'
 
-    def target_check(self, client, user_target, cond):
-        if cond == unban:
-            action = 'unban'
-        else:
-            action = 'ban'
+    # check if a target is viable for a command
+    def target_check(self, client, user_target, condition):
+        # format command into readable text
+        action = condition[1:-1]
 
+        # if target does not exist, return false
         if not self.check_acct(user_target):
             error = f'Could not {action} {user_target}, user does not exist'
             self.logger.error(error)
             client.send(error.encode('utf-8'))
             return False
 
-        if cond == unban and not self.check_role(user_target, banned):
+        # if attempting to unban and target is not banned, return false
+        if condition == unban and not self.check_role(user_target, banned):
             error = f'Could not unban {user_target}, user is not banned'
             self.logger.error(error)
             client.send(error.encode('utf-8'))
@@ -268,7 +283,7 @@ class ServerHost:
         return True
 
     def create_db(self):
-        connection = sqlite3.connect('userdata.db')
+        connection = sqlite3.connect(database)
         cursor = connection.cursor()
 
         try:
@@ -280,29 +295,42 @@ class ServerHost:
             )
             ''')
 
-            cursor.execute("""
-            INSERT INTO accounts VALUES
-                ('Archaon', 'pass', 'admin') 
-            """)
-
             connection.commit()
 
+            self.logger.info(f'Database {database} created')
+
+            # create default admin account
+            self.create_acct('Archaon', 'pass'.encode('utf-8'), role=admin)
+
         except sqlite3.OperationalError:
+            self.logger.info('Database could not be created as it already exists')
             return
 
-    def create_acct(self, username, password):
-        connection = sqlite3.connect('userdata.db')
+    # Creates new account with hashed password
+    def create_acct(self, username, password, role=user):
+        self.logger.info(f'Attempting to create account {username}')
+
+        # create hash w/ salt for password
+        hashed = bcrypt.hashpw(password, bcrypt.gensalt())
+
+        connection = sqlite3.connect(database)
         cursor = connection.cursor()
 
+        # create account in database
         cursor.execute(f"""
         INSERT INTO accounts VALUES
-            ('{username}', '{password}', 'user')
+            ('{username}', '{hashed.decode('utf-8')}', '{role}')
         """)
 
         connection.commit()
 
+        self.logger.info(f'Account {username} successfully created')
+
+    # Check if an account exists in db
     def check_acct(self, username):
-        connection = sqlite3.connect('userdata.db')
+        self.logger.info(f'Checking if {username} exists in database')
+
+        connection = sqlite3.connect(database)
         cursor = connection.cursor()
 
         cursor.execute(f"""
@@ -318,8 +346,11 @@ class ServerHost:
             return True
         return False
 
+    # Check if user inputted password matches db password hash
     def check_pass(self, username, password):
-        connection = sqlite3.connect('userdata.db')
+        self.logger.info(f'Checking password for requested login for {username}')
+
+        connection = sqlite3.connect(database)
         cursor = connection.cursor()
 
         cursor.execute(f"""
@@ -327,16 +358,19 @@ class ServerHost:
             WHERE username = '{username}'
         """)
 
-        data = cursor.fetchone()
+        # password hash
+        hash_data = cursor.fetchone()[0]
 
         connection.commit()
 
-        if data[0] == password:
-            return True
-        return False
+        # return true if password matches hash
+        return bcrypt.checkpw(password, hash_data.encode('utf-8'))
 
-    def check_role(self, username, cond):
-        connection = sqlite3.connect('userdata.db')
+    # Check account role in db
+    def check_role(self, username, condition):
+        self.logger.info(f"Checking {username}'s role")
+
+        connection = sqlite3.connect(database)
         cursor = connection.cursor()
 
         cursor.execute(f"""
@@ -344,11 +378,12 @@ class ServerHost:
             WHERE username = '{username}'
         """)
 
-        role = cursor.fetchone()
+        role = cursor.fetchone()[0]
 
         connection.commit()
 
-        if role[0] == cond:
+        # if role matches required condition
+        if role == condition:
             return True
         return False
 
