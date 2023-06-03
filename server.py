@@ -57,6 +57,8 @@ class ServerHost:
             access, username = self.login(client, f_addr)
             if access:
                 break
+            elif not username:  # if connection lost during login
+                return
 
         try:
             while True:
@@ -103,7 +105,7 @@ class ServerHost:
 
         except ConnectionResetError:
             self.logger.error(f'Connection lost with {f_addr} while attempting login')
-            return
+            return None, None
 
     # Gathers plaintext username and bytestring password from client
     def login_data(self, client, f_addr):
