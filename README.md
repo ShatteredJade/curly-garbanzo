@@ -19,3 +19,9 @@ You can install it manually via
 or by using the requirements.txt
 
     pip install -r requirements.txt
+
+The default administrator account login is
+
+Username: Archaon (case sensitive)
+
+Password: pass
