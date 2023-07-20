@@ -1,1 +1,1 @@
-python_bcrypt==0.3.2
+bcrypt==4.0.1
