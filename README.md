@@ -23,4 +23,5 @@ or by using the requirements.txt
 The default administrator account login is
 
 Username: Archaon
+
 Password: pass
